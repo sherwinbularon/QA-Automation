@@ -29,11 +29,23 @@ jobs:
         if: always()
         run: |
           test -s report.json || { echo "::error::empty report"; exit 1; }
-          curl --fail --show-error --silent -X POST "${{ secrets.WATCHTOWER_INGEST_URL }}" \
+          # Retry the upload: a single 429/blip from the dashboard host must not
+          # lose a finished report (#133).
+          status=$(curl --silent --show-error --output response.txt --write-out "%{http_code}" \
+            --retry 5 --retry-all-errors --retry-delay 10 \
+            -X POST "${{ secrets.WATCHTOWER_INGEST_URL }}" \
             -H "Authorization: Bearer ${{ secrets.WATCHTOWER_INGEST_TOKEN }}" \
             -H "Content-Type: application/json" \
             -H "X-Watchtower-Repo: ${{ github.repository }}" \
             -H "X-Watchtower-Branch: ${{ github.ref_name }}" \
             -H "X-Watchtower-Commit: ${{ github.sha }}" \
             -H "X-Watchtower-Suite: ${{ inputs.path }}" \
-            --data @report.json
+            --data @report.json) || true
+          case "$status" in
+            2??) echo "Report ingested (HTTP $status)" ;;
+            *)
+              echo "::error::report upload failed after retries (HTTP ${status:-none})"
+              [ -s response.txt ] && { echo "Response body:"; cat response.txt; }
+              exit 1
+              ;;
+          esac
