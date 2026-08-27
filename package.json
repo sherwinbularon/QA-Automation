@@ -1,0 +1,9 @@
+{
+  "name": "qa-automation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Watchtower connected test repo — root Playwright smoke suite for CI patrol.",
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}

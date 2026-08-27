@@ -17,14 +17,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20, cache: npm }
-      - run: npm ci
-      - run: npx playwright install --with-deps
+        with: { node-version: 20 }
+      # No committed lockfile (this repo is a bag of test sub-projects, not a
+      # single Node app), so install rather than `npm ci`, and skip npm cache
+      # (its key needs a lockfile).
+      - run: npm install
+      - run: npx playwright install --with-deps chromium
       - name: Run tests
         env:
-          PATROL_PATH: ${{ inputs.path }}
           PATROL_GREP: ${{ inputs.grep }}
-        run: npx playwright test $PATROL_PATH ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json > report.json || true
+        # The dashboard's `path` input carries Cypress-style globs the root
+        # Playwright project can't run, so run the root e2e suite and let grep
+        # narrow it. Produces a JSON report for the ingest step below.
+        run: npx playwright test ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json > report.json || true
       - name: Report to Watchtower
         if: always()
         run: |
