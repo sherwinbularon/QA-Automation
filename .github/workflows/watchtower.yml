@@ -10,6 +10,10 @@ on:
         description: "Only run tests whose title matches this pattern"
         required: false
         default: ""
+      env:
+        description: "Which environment to target (exposed to tests as TEST_ENV)"
+        required: false
+        default: ""
 jobs:
   test-and-report:
     runs-on: ubuntu-latest
@@ -17,19 +21,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      # No committed lockfile (this repo is a bag of test sub-projects, not a
-      # single Node app), so install rather than `npm ci`, and skip npm cache
-      # (its key needs a lockfile).
-      - run: npm install
-      - run: npx playwright install --with-deps chromium
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps
       - name: Run tests
         env:
+          PATROL_PATH: ${{ inputs.path }}
           PATROL_GREP: ${{ inputs.grep }}
-        # The dashboard's `path` input carries Cypress-style globs the root
-        # Playwright project can't run, so run the root e2e suite and let grep
-        # narrow it. Produces a JSON report for the ingest step below.
-        run: npx playwright test ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json > report.json || true
+          # Exposed to the tests so the repo's config can map it to a baseURL (#136).
+          TEST_ENV: ${{ inputs.env }}
+          # Write the JSON reporter straight to a file — NOT via stdout redirect.
+          # A repo's global-setup/test console output pollutes stdout, corrupting
+          # a "> report.json" capture into invalid JSON the ingest rejects (#166).
+          PLAYWRIGHT_JSON_OUTPUT_NAME: report.json
+        run: npx playwright test $PATROL_PATH ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json || true
       - name: Report to Watchtower
         if: always()
         run: |
@@ -37,7 +42,7 @@ jobs:
           # Retry the upload: a single 429/blip from the dashboard host must not
           # lose a finished report (#133).
           status=$(curl --silent --show-error --output response.txt --write-out "%{http_code}" \
-            --retry 5 --retry-all-errors --retry-delay 10 \
+            --retry 15 --retry-all-errors --retry-delay 25 \
             -X POST "${{ secrets.WATCHTOWER_INGEST_URL }}" \
             -H "Authorization: Bearer ${{ secrets.WATCHTOWER_INGEST_TOKEN }}" \
             -H "Content-Type: application/json" \
@@ -45,6 +50,8 @@ jobs:
             -H "X-Watchtower-Branch: ${{ github.ref_name }}" \
             -H "X-Watchtower-Commit: ${{ github.sha }}" \
             -H "X-Watchtower-Suite: ${{ inputs.path }}" \
+            -H "X-Watchtower-Grep: ${{ inputs.grep }}" \
+            -H "X-Watchtower-Env: ${{ inputs.env }}" \
             --data @report.json) || true
           case "$status" in
             2??) echo "Report ingested (HTTP $status)" ;;
@@ -54,3 +61,13 @@ jobs:
               exit 1
               ;;
           esac
+      # The report survives even when every retry loses (edge throttling,
+      # #133): recover it from the run's artifacts and ingest by hand.
+      - name: Keep report as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchtower-report
+          path: report.json
+          retention-days: 7
+          if-no-files-found: ignore
