@@ -14,60 +14,155 @@ on:
         description: "Which environment to target (exposed to tests as TEST_ENV)"
         required: false
         default: ""
+      parallel:
+        description: "Run each repeat as its own job at the same time instead of one after another"
+        required: false
+        default: "false"
+      repeat:
+        description: "Run the selected tests this many times, keeping each run's report (flaky-test evidence)"
+        required: false
+        default: "1"
 jobs:
   test-and-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: ${{ (inputs.parallel == 'true' && 30) || (inputs.repeat == '5' && 150) || (inputs.repeat == '4' && 120) || (inputs.repeat == '3' && 90) || (inputs.repeat == '2' && 60) || 30 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJSON((inputs.parallel == 'true' && ((inputs.repeat == '5' && '[1,2,3,4,5]') || (inputs.repeat == '4' && '[1,2,3,4]') || (inputs.repeat == '3' && '[1,2,3]') || (inputs.repeat == '2' && '[1,2]'))) || '[0]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20, cache: npm }
-      - run: npm ci
-      - run: npx playwright install --with-deps
+      # The installed tree, keyed on the lockfile hash: an unchanged lockfile restores exactly what a
+      # previous clean install produced, any change is a miss and a fresh install.
+      - uses: actions/cache/restore@v4
+        id: nmcache
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-node20-${{ hashFiles('package-lock.json') }}
+      - name: Install dependencies
+        if: steps.nmcache.outputs.cache-hit != 'true'
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - uses: actions/cache/save@v4
+        if: steps.nmcache.outputs.cache-hit != 'true'
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-node20-${{ hashFiles('package-lock.json') }}
+      # Browsers are cached per Playwright version and browser set (no fallback keys, so an older
+      # build is never restored). Installing all three engines pulls ~180 extra OS packages (the
+      # WebKit/Firefox media stack), so only Chromium is installed when the root config is plainly
+      # Chromium-only: no other engine or channel named, and no local imports that could add one.
+      # Anything else installs everything, as before.
+      - name: Playwright version and browsers
+        id: pwv
+        run: |
+          echo "v=$(npx playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+          cfg=$(ls playwright.config.ts playwright.config.js playwright.config.mjs playwright.config.cjs 2>/dev/null | head -1 || true)
+          browsers=""
+          if [ -n "$cfg" ] && ! grep -qiE "firefox|webkit|safari|iphone|ipad|msedge|channel" "$cfg" && ! grep -qE "(from|require)[ (]*.[.][.]?/" "$cfg"; then
+            browsers=chromium
+          fi
+          echo "browsers=$browsers" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: pwcache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pwv.outputs.v }}-${{ steps.pwv.outputs.browsers || 'all' }}
+      - name: Install browsers
+        if: steps.pwcache.outputs.cache-hit != 'true'
+        env:
+          PW_BROWSERS: ${{ steps.pwv.outputs.browsers }}
+        run: npx playwright install --with-deps $PW_BROWSERS
+      # Saved right after the install, not at job end: a failing test or upload must not lose the cache.
+      - uses: actions/cache/save@v4
+        if: steps.pwcache.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pwv.outputs.v }}-${{ steps.pwv.outputs.browsers || 'all' }}
+      - name: Install system dependencies
+        if: steps.pwcache.outputs.cache-hit == 'true'
+        env:
+          PW_BROWSERS: ${{ steps.pwv.outputs.browsers }}
+        run: npx playwright install-deps $PW_BROWSERS
       - name: Run tests
         env:
           PATROL_PATH: ${{ inputs.path }}
           PATROL_GREP: ${{ inputs.grep }}
           # Exposed to the tests so the repo's config can map it to a baseURL (#136).
           TEST_ENV: ${{ inputs.env }}
-          # Write the JSON reporter straight to a file — NOT via stdout redirect.
-          # A repo's global-setup/test console output pollutes stdout, corrupting
-          # a "> report.json" capture into invalid JSON the ingest rejects (#166).
-          PLAYWRIGHT_JSON_OUTPUT_NAME: report.json
-        run: npx playwright test $PATROL_PATH ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json || true
+          PATROL_REPEAT: ${{ inputs.repeat }}
+          PATROL_RUN: ${{ matrix.run }}
+        run: |
+          repeat="${PATROL_REPEAT:-1}"
+          case "$repeat" in ''|*[!0-9]*) repeat=1 ;; ??*) repeat=5 ;; esac
+          [ "$repeat" -lt 1 ] && repeat=1
+          [ "$repeat" -gt 5 ] && repeat=5
+          # Parallel mode: each matrix job runs only its own run number (0 = every run, one after another).
+          if [ "${PATROL_RUN:-0}" -gt 0 ]; then runs="$PATROL_RUN"; else runs=$(seq 1 "$repeat"); fi
+          for i in $runs; do
+            # Write the JSON reporter straight to a file — NOT via stdout redirect.
+            # A repo's global-setup/test console output pollutes stdout, corrupting
+            # a "> report.json" capture into invalid JSON the ingest rejects (#166).
+            PLAYWRIGHT_JSON_OUTPUT_NAME="report-$i.json" npx playwright test $PATROL_PATH ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json || true
+          done
       - name: Report to Watchtower
         if: always()
+        env:
+          PATROL_REPEAT: ${{ inputs.repeat }}
+          # Passed as env, never pasted into the script: dispatch inputs are user-supplied.
+          PATROL_PATH: ${{ inputs.path }}
+          PATROL_GREP: ${{ inputs.grep }}
+          PATROL_ENV: ${{ inputs.env }}
+          PATROL_RUN: ${{ matrix.run }}
         run: |
-          test -s report.json || { echo "::error::empty report"; exit 1; }
-          # Retry the upload: a single 429/blip from the dashboard host must not
-          # lose a finished report (#133).
-          status=$(curl --silent --show-error --output response.txt --write-out "%{http_code}" \
-            --retry 15 --retry-all-errors --retry-delay 25 \
-            -X POST "${{ secrets.WATCHTOWER_INGEST_URL }}" \
-            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_INGEST_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -H "X-Watchtower-Repo: ${{ github.repository }}" \
-            -H "X-Watchtower-Branch: ${{ github.ref_name }}" \
-            -H "X-Watchtower-Commit: ${{ github.sha }}" \
-            -H "X-Watchtower-Suite: ${{ inputs.path }}" \
-            -H "X-Watchtower-Grep: ${{ inputs.grep }}" \
-            -H "X-Watchtower-Env: ${{ inputs.env }}" \
-            --data @report.json) || true
-          case "$status" in
-            2??) echo "Report ingested (HTTP $status)" ;;
-            *)
-              echo "::error::report upload failed after retries (HTTP ${status:-none})"
-              [ -s response.txt ] && { echo "Response body:"; cat response.txt; }
-              exit 1
-              ;;
-          esac
+          repeat="${PATROL_REPEAT:-1}"
+          case "$repeat" in ''|*[!0-9]*) repeat=1 ;; ??*) repeat=5 ;; esac
+          [ "$repeat" -lt 1 ] && repeat=1
+          [ "$repeat" -gt 5 ] && repeat=5
+          # Parallel mode: each matrix job runs only its own run number (0 = every run, one after another).
+          if [ "${PATROL_RUN:-0}" -gt 0 ]; then runs="$PATROL_RUN"; else runs=$(seq 1 "$repeat"); fi
+          failed=0
+          for i in $runs; do
+            rm -f response.txt
+            # A run that produced no report is reported as an error, but the
+            # remaining runs are still uploaded so the comparison sees them.
+            test -s "report-$i.json" || { echo "::error::empty report for run $i"; failed=1; continue; }
+            # Retry the upload: a single 429/blip from the dashboard host must not
+            # lose a finished report (#133).
+            status=$(curl --silent --show-error --output response.txt --write-out "%{http_code}" \
+              --retry 15 --retry-all-errors --retry-delay 25 \
+              -X POST "${{ secrets.WATCHTOWER_INGEST_URL }}" \
+              -H "Authorization: Bearer ${{ secrets.WATCHTOWER_INGEST_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -H "X-Watchtower-Repo: ${{ github.repository }}" \
+              -H "X-Watchtower-Branch: ${{ github.ref_name }}" \
+              -H "X-Watchtower-Commit: ${{ github.sha }}" \
+              -H "X-Watchtower-Suite: $PATROL_PATH" \
+              -H "X-Watchtower-Grep: $PATROL_GREP" \
+              -H "X-Watchtower-Env: $PATROL_ENV" \
+              -H "X-Watchtower-Repeat-Test: $repeat" \
+              -H "X-Watchtower-Run-Number: $i" \
+              -H "X-Watchtower-Run-Group: ${{ github.run_id }}-${{ github.run_attempt }}" \
+              --data @"report-$i.json") || true
+            case "$status" in
+              2??) echo "Run $i report ingested (HTTP $status)" ;;
+              *)
+                echo "::error::run $i report upload failed after retries (HTTP ${status:-none})"
+                [ -s response.txt ] && { echo "Response body:"; cat response.txt; }
+                failed=1
+                ;;
+            esac
+          done
+          exit $failed
       # The report survives even when every retry loses (edge throttling,
       # #133): recover it from the run's artifacts and ingest by hand.
       - name: Keep report as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: watchtower-report
-          path: report.json
+          # One artifact per matrix job: upload-artifact rejects a second upload under the same name.
+          name: watchtower-report${{ matrix.run != 0 && format('-{0}', matrix.run) || '' }}
+          path: report-*.json
           retention-days: 7
           if-no-files-found: ignore
