@@ -22,6 +22,10 @@ on:
         description: "Run the selected tests this many times, keeping each run's report (flaky-test evidence)"
         required: false
         default: "1"
+      test_data:
+        description: "Name of the Actions secret holding this run's Watchtower test data (set by Watchtower)"
+        required: false
+        default: ""
 jobs:
   test-and-report:
     runs-on: ubuntu-latest
@@ -85,6 +89,26 @@ jobs:
         env:
           PW_BROWSERS: ${{ steps.pwv.outputs.browsers }}
         run: npx playwright install-deps $PW_BROWSERS
+      - name: Load Watchtower test data
+        if: inputs.test_data != ''
+        env:
+          WATCHTOWER_TEST_DATA: ${{ secrets[inputs.test_data] }}
+        run: |
+          node - <<'WT_EOF'
+          const fs = require("fs");
+          const raw = process.env.WATCHTOWER_TEST_DATA || "";
+          if (!raw) { console.log("Watchtower test data: no secret found for this run. Re-provision the repo under Settings -> CI / Repos if values were expected."); process.exit(0); }
+          const data = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+          const plain = data.plain || {}, secret = data.secret || {};
+          for (const v of Object.values(secret)) for (const line of String(v).split("\n")) if (line.trim()) console.log("::add-mask::" + line);
+          let out = "";
+          for (const [k, v] of Object.entries(Object.assign({}, plain, secret))) {
+            const d = "WT_" + Math.random().toString(36).slice(2);
+            out += k + "<<" + d + "\n" + v + "\n" + d + "\n";
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, out);
+          console.log("Watchtower test data: " + Object.keys(plain).length + " plain and " + Object.keys(secret).length + " secret value(s) loaded for " + (data.env || "this run") + ".");
+          WT_EOF
       - name: Run tests
         env:
           PATROL_PATH: ${{ inputs.path }}
@@ -106,6 +130,30 @@ jobs:
             # a "> report.json" capture into invalid JSON the ingest rejects (#166).
             PLAYWRIGHT_JSON_OUTPUT_NAME="report-$i.json" npx playwright test $PATROL_PATH ${PATROL_GREP:+--grep "$PATROL_GREP"} --reporter=json || true
           done
+      # Test data (#434): secrets out of report-*.json before the upload and the kept artifact.
+      - name: Scrub test data from reports
+        if: always() && inputs.test_data != ''
+        env:
+          WATCHTOWER_TEST_DATA: ${{ secrets[inputs.test_data] }}
+        run: |
+          node - WATCHTOWER_TEST_DATA <<'WT_EOF'
+          const fs = require("fs");
+          const raw = process.env[process.argv[2] || ""] || "";
+          if (!raw) process.exit(0);
+          const data = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+          const secrets = Object.values(data.secret || {}).concat(Object.values(data.secretVars || {}).map((n) => process.env[n] || "")).map(String).filter((s) => s.length >= 4);
+          const scrub = (s) => secrets.reduce((t, n) => t.split(n).join("[redacted]"), s);
+          const walk = (v) => typeof v === "string" ? scrub(v) : Array.isArray(v) ? v.map(walk) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, walk(x)])) : v;
+          let n = 0;
+          for (const f of fs.readdirSync(".").filter((f) => /^report-.*\.json$/.test(f))) {
+            const text = fs.readFileSync(f, "utf8");
+            let out;
+            try { out = JSON.stringify(walk(JSON.parse(text))); } catch { out = scrub(text); }
+            fs.writeFileSync(f, out);
+            n++;
+          }
+          console.error("Watchtower test data: secrets scrubbed from " + n + " report file(s).");
+          WT_EOF
       - name: Report to Watchtower
         if: always()
         env:
